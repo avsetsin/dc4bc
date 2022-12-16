@@ -22,20 +22,22 @@ jobs:
           echo ${{ matrix.platform }} | {
             IFS='/' read -r GOOS GOARCH
 
-            output_dir=build
             export GOOS GOARCH CGO_ENABLED=0
 
-            go build -o $output_dir/dc4bc_d ./cmd/dc4bc_d/
-            go build -o $output_dir/dc4bc_cli ./cmd/dc4bc_cli/
-            go build -o $output_dir/dc4bc_airgapped ./cmd/airgapped/
-            go build -o $output_dir/dc4bc_dkg_reinitializer ./cmd/dkg_reinitializer/
+            go build -o build/dc4bc_d ./cmd/dc4bc_d/
+            go build -o build/dc4bc_cli ./cmd/dc4bc_cli/
+            go build -o build/dc4bc_airgapped ./cmd/airgapped/
+            go build -o build/dc4bc_dkg_reinitializer ./cmd/dkg_reinitializer/
 
-            sha256sum $output_dir/dc4bc_* > "$output_dir/checksum.txt"
+            sha256sum build/dc4bc_* > "build/checksum.txt"
             echo "platform=$GOOS-$GOARCH" >> $GITHUB_OUTPUT
           }
+
+      - name: Tar files
+        run: tar -cvf build-${{ steps.compile.outputs.platform }}.tar build/*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v2
         with:
           name: build-${{ steps.compile.outputs.platform }}
-          path: build/*
+          path: build-${{ steps.compile.outputs.platform }}.tar
