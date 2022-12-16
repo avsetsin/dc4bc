@@ -22,22 +22,20 @@ import (
 	"time"
 
 	"github.com/corestario/kyber/pairing/bls12381"
-	"github.com/lidofinance/dc4bc/dkg"
-	fsmtypes "github.com/lidofinance/dc4bc/fsm/types"
-	"github.com/lidofinance/dc4bc/pkg/utils"
+	"github.com/fatih/color"
+	"github.com/spf13/cobra"
 
 	httprequests "github.com/lidofinance/dc4bc/client/api/http_api/requests"
 	httpresponses "github.com/lidofinance/dc4bc/client/api/http_api/responses"
-
 	"github.com/lidofinance/dc4bc/client/types"
+	"github.com/lidofinance/dc4bc/dkg"
 	"github.com/lidofinance/dc4bc/fsm/fsm"
 	"github.com/lidofinance/dc4bc/fsm/state_machines"
 	spf "github.com/lidofinance/dc4bc/fsm/state_machines/signature_proposal_fsm"
+	fsmtypes "github.com/lidofinance/dc4bc/fsm/types"
 	"github.com/lidofinance/dc4bc/fsm/types/requests"
 	"github.com/lidofinance/dc4bc/fsm/types/responses"
-
-	"github.com/fatih/color"
-	"github.com/spf13/cobra"
+	"github.com/lidofinance/dc4bc/pkg/utils"
 )
 
 const (
@@ -108,6 +106,7 @@ func main() {
 		getFSMListCommand(),
 		getSignatureDataCommand(),
 		refreshState(),
+		proposeSignBakedMessagesCommand(),
 	)
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("Failed to execute root command: %v", err)
@@ -952,6 +951,55 @@ func proposeSignBatchMessagesCommand() *cobra.Command {
 				return fmt.Errorf("failed to make HTTP request to propose message to sign: %v", resp.ErrorMessage)
 			}
 
+			return nil
+		},
+	}
+}
+
+func proposeSignBakedMessagesCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sign_baked [dkg_id] [range_start] [range_end]",
+		Args:  cobra.ExactArgs(3),
+		Short: "sends a propose message to sign the part of data baked into the binary",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			listenAddr, err := cmd.Flags().GetString(flagListenAddr)
+			if err != nil {
+				return fmt.Errorf("failed to read configuration: %v", err)
+			}
+
+			dkgID, err := hex.DecodeString(args[0])
+			if err != nil {
+				return fmt.Errorf("failed to decode dkgID: %w", err)
+			}
+
+			range_start, err := strconv.Atoi(args[1])
+			if err != nil {
+				return fmt.Errorf("failed to parse range_start: %w", err)
+			}
+			range_end, err := strconv.Atoi(args[2])
+			if err != nil {
+				return fmt.Errorf("failed to parse range_end: %w", err)
+			}
+
+			req := httprequests.ProposeSignBakedMessagesForm{
+				DkgID:      dkgID,
+				RangeStart: range_start,
+				RangeEnd:   range_end,
+			}
+
+			messageDataBz, err := json.Marshal(&req)
+			if err != nil {
+				return fmt.Errorf("failed to Marshal ProposeSignBakedMessagesForm request: %w", err)
+			}
+
+			resp, err := rawPostRequest(fmt.Sprintf("http://%s/proposeSignBakedMessages", listenAddr),
+				"application/json", messageDataBz)
+			if err != nil {
+				return fmt.Errorf("failed to make HTTP request to propose message to sign: %w", err)
+			}
+			if resp.ErrorMessage != "" {
+				return fmt.Errorf("failed to make HTTP request to propose message to sign: %v", resp.ErrorMessage)
+			}
 			return nil
 		},
 	}

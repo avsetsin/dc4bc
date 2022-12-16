@@ -24,6 +24,7 @@ import (
 	"github.com/lidofinance/dc4bc/airgapped"
 	"github.com/lidofinance/dc4bc/pkg/prysm"
 	"github.com/lidofinance/dc4bc/pkg/utils"
+	"github.com/lidofinance/dc4bc/pkg/wc_rotation"
 
 	"github.com/lidofinance/dc4bc/client/api/dto"
 	"github.com/lidofinance/dc4bc/client/api/http_api"
@@ -57,7 +58,7 @@ var (
 	msgToIgnore               string
 	roundToIgnore             string
 
-	sigReconstructedRegexp = regexp.MustCompile(`(?m)\[node_\d] Successfully processed message with offset \d{0,3}, type signature_reconstructed`)
+	sigReconstructedRegexp = regexp.MustCompile(`(?m)\[[a-z0-9_]+] Successfully processed message with offset \d{0,3}, type signature_reconstructed`)
 
 	sigReconstructionStartedRegexp = regexp.MustCompile(`(?m)\[node_\d] Collected enough partial signatures. Full signature reconstruction just started`)
 
@@ -161,11 +162,16 @@ func (l *savingLogger) resetLogs() {
 	l.logs = make([]string, 0)
 }
 
-func initNodes(numNodes int, startingPort int, storagePath string, topic string, mnemonics []string) (nodes []*nodeInstance, err error) {
+func initNodes(numNodes int, startingPort int, storagePath string, topic string, mnemonics []string, usernames []string) (nodes []*nodeInstance, err error) {
 	nodes = make([]*nodeInstance, numNodes)
 	for nodeID := 0; nodeID < numNodes; nodeID++ {
 		var ctx, cancel = context.WithCancel(context.Background())
+
 		var userName = fmt.Sprintf("node_%d", nodeID)
+		if usernames != nil {
+			userName = usernames[nodeID]
+		}
+
 		var state, err = state2.NewLevelDBState(fmt.Sprintf("/tmp/dc4bc_node_%d_state", nodeID), topic)
 		if err != nil {
 			return nodes, fmt.Errorf("nodeInstance %d failed to init state: %v\n", nodeID, err)
@@ -349,6 +355,40 @@ func signMessage(dkgID []byte, msg, addr string) ([]byte, error) {
 	}
 
 	resp, err := http.Post(fmt.Sprintf("http://%s/proposeSignMessage", addr),
+		"application/json", bytes.NewReader(messageDataBz))
+	if err != nil {
+		return nil, fmt.Errorf("failed to send HTTP request to sign message: %v\n", err)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read HTTP response body: %w", err)
+	}
+
+	var response api_responses.BaseResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal HTTP response body: %w", err)
+	}
+
+	if len(response.ErrorMessage) != 0 {
+		return nil, fmt.Errorf("failed to propose sign message: %s", response.ErrorMessage)
+	}
+	return messageDataBz, nil
+}
+
+func signBakedMessage(dkgID []byte, range_start, range_end int, addr string) ([]byte, error) {
+	req := httprequests.ProposeSignBakedMessagesForm{
+		DkgID:      dkgID,
+		RangeStart: range_start,
+		RangeEnd:   range_end,
+	}
+
+	messageDataBz, err := json.Marshal(&req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to Marshal ProposeSignBakedMessagesForm request: %w", err)
+	}
+
+	resp, err := http.Post(fmt.Sprintf("http://%s/proposeSignBakedMessages", addr),
 		"application/json", bytes.NewReader(messageDataBz))
 	if err != nil {
 		return nil, fmt.Errorf("failed to send HTTP request to sign message: %v\n", err)
@@ -654,11 +694,13 @@ func startServerRunAndPoll(nodes []*nodeInstance, callback processedOperationCal
 	return runCancel
 }
 
-func verifySignatures(dkgID string, n *nodeInstance) error {
+func verifySignatures(dkgID string, n *nodeInstance, validxs []int64) error {
 	allSignatures, err := n.sigService.GetSignatures(&dto.DkgIdDTO{DkgID: dkgID})
 	if err != nil {
 		return fmt.Errorf("failed to get signatures: %w", err)
 	}
+
+	singedRoot := map[int64][]byte{}
 
 	//verifying on airgapped node
 	for _, batchSignatures := range allSignatures {
@@ -668,6 +710,24 @@ func verifySignatures(dkgID string, n *nodeInstance) error {
 				if err != nil {
 					return fmt.Errorf("failed to verify on airgapped: %w", err)
 				}
+				if len(validxs) > 0 {
+					singedRoot[s.ValIdx] = s.SrcPayload
+				}
+				fmt.Println(s.ValIdx, s.SrcPayload)
+			}
+		}
+	}
+
+	// check we signed all validx's roots with signbakeddata method
+	if len(validxs) > 0 {
+		for _, id := range validxs {
+			root := singedRoot[id]
+			expectedRoot, err := wc_rotation.GetSigningRoot(uint64(id))
+			if err != nil {
+				return fmt.Errorf("failed to get signed root for %d: %w", id, err)
+			}
+			if !bytes.Equal(root, expectedRoot[:]) {
+				return fmt.Errorf("expected root {%x}, got {%x}", expectedRoot, root)
 			}
 		}
 	}
@@ -697,13 +757,13 @@ func verifySignatures(dkgID string, n *nodeInstance) error {
 			s := participantReconstructedSignatures[0]
 			f, err := os.OpenFile(path.Join(dir, s.File), os.O_WRONLY|os.O_CREATE, 0600)
 			if err != nil {
-				return fmt.Errorf("filed to crete tmp file: %w", err)
+				return fmt.Errorf("failed to create tmp file: %w", err)
 			}
 			defer f.Close()
 
 			_, err = f.Write(s.SrcPayload)
 			if err != nil {
-				return fmt.Errorf("filed to write to tmp file: %w", err)
+				return fmt.Errorf("failed to write to tmp file: %w", err)
 			}
 		}
 
@@ -746,7 +806,7 @@ func TestStandardFlow(t *testing.T) {
 	startingPort := 8085
 	topic := "test_topic"
 	storagePath := "/tmp/dc4bc_storage"
-	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil)
+	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to init nodes, err: %v", err)
 	}
@@ -765,6 +825,7 @@ func TestStandardFlow(t *testing.T) {
 	log.Println("Propose message to sign")
 
 	dkgID := sha256.Sum256(messageDataBz)
+
 	messageDataBz, err = signMessage(dkgID[:], "message to sign", nodes[len(nodes)-1].listenAddr)
 	if err != nil {
 		t.Fatal(err.Error())
@@ -809,6 +870,83 @@ func TestStandardFlow(t *testing.T) {
 	}
 }
 
+func TestBakedMessagesFlow(t *testing.T) {
+	_ = RemoveContents("/tmp", "dc4bc_*")
+	defer func() { _ = RemoveContents("/tmp", "dc4bc_*") }()
+
+	numNodes := 4
+	threshold := 2
+	startingPort := 8085
+	topic := "test_topic"
+	storagePath := "/tmp/dc4bc_storage"
+	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to init nodes, err: %v", err)
+	}
+
+	// Each nodeInstance starts to Poll().
+	runCancel := startServerRunAndPoll(nodes, nil)
+
+	// Last nodeInstance tells other participants to start DKG.
+	messageDataBz, err := startDkg(nodes, threshold)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	waitForDKG()
+
+	log.Println("Propose message to sign")
+
+	dkgID := sha256.Sum256(messageDataBz)
+	messageDataBz, err = signBakedMessage(dkgID[:], 0, 5, nodes[len(nodes)-1].listenAddr)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	waitForSignMsg()
+
+	for _, n := range nodes {
+		if matches := n.clientLogger.checkLogsWithRegexp(sigReconstructionStartedRegexp, 70); matches != 1 {
+			t.Fatalf("not enough checks: %d", matches)
+		} else {
+			fmt.Println("reconstruction started")
+		}
+	}
+
+	for _, n := range nodes {
+		if matches := n.clientLogger.checkLogsWithRegexp(sigReconstructedRegexp, 70); matches != 4 {
+			t.Fatalf("not enough checks: %d", matches)
+		} else {
+			fmt.Println("messaged signed successfully")
+		}
+	}
+
+	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0], []int64{52694, 52695, 52696, 52697, 52698})
+	if err != nil {
+		t.Fatalf("failed to verify signatures: %v\n", err)
+	}
+
+	fmt.Println("Sign message again")
+	if _, err := http.Post(fmt.Sprintf("http://%s/proposeSignBakedMessages", nodes[len(nodes)-1].listenAddr),
+		"application/json", bytes.NewReader(messageDataBz)); err != nil {
+		t.Fatalf("failed to send HTTP request to sign message: %v\n", err)
+	}
+	waitForSignMsg()
+
+	for _, n := range nodes {
+		if matches := n.clientLogger.checkLogsWithRegexp(sigReconstructedRegexp, 100); matches != 8 {
+			t.Fatalf("not enough checks: %d", matches)
+		} else {
+			fmt.Println("messaged signed successfully")
+		}
+	}
+
+	runCancel()
+	for _, node := range nodes {
+		node.httpApi.Stop(node.ctx)
+		node.clientCancel()
+	}
+}
+
 func TestStandardBatchFlow(t *testing.T) {
 	_ = RemoveContents("/tmp", "dc4bc_*")
 	defer func() { _ = RemoveContents("/tmp", "dc4bc_*") }()
@@ -818,7 +956,7 @@ func TestStandardBatchFlow(t *testing.T) {
 	startingPort := 8105
 	topic := "test_topic"
 	storagePath := "/tmp/dc4bc_storage"
-	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil)
+	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to init nodes, err: %v", err)
 	}
@@ -881,7 +1019,7 @@ func TestStandardBatchFlow(t *testing.T) {
 		}
 	}
 
-	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0])
+	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0], nil)
 	if err != nil {
 		t.Fatalf("failed to verify signatures: %v\n", err)
 	}
@@ -902,7 +1040,7 @@ func TestResetStateFlow(t *testing.T) {
 	startingPort := 8090
 	topic := "test_topic"
 	storagePath := "/tmp/dc4bc_storage"
-	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil)
+	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to init nodes, err: %v", err)
 	}
@@ -1043,7 +1181,103 @@ func convertDKGMessageto0_1_4(orig types.ReDKG) types.ReDKG {
 	return newDKG
 }
 
-func testReinitDKGFlow(t *testing.T, convertDKGTo10_1_4 bool) {
+// The test tests reinit procedure with the real kafka log received during corridor testing by engineers with dc4bc v0.1.4 release
+func TestReinitDKGFlow_authentic0_1_4(t *testing.T) {
+	_ = RemoveContents("/tmp", "dc4bc_*")
+	defer func() { _ = RemoveContents("/tmp", "dc4bc_*") }()
+
+	mnemonics := []string{
+		"cigar family price stove waste reform midnight ceiling panic guitar team merge noble cycle table biology begin consider rally pair spend weapon perfect vague",
+		"panic shuffle tell injury pass bamboo play eye diet play industry banner law poet west chase library print shed image jeans degree fabric like",
+		"wage danger sword copper alone jelly hollow gaze mouse picnic eternal april drink fashion invite mansion follow cover crucial apology salmon destroy repair add",
+		"fever tongue elite spice relief nominee barrel yellow word tissue about urban library clap access forward flame seat remove cradle chimney problem cream twelve",
+	}
+	usernames := []string{
+		"swelf",
+		"callmepak",
+		"ratik",
+		"sotnikov",
+	}
+
+	numNodes := 4
+	startingPort := 8095
+
+	topic := "test_topic"
+	storagePath := "/tmp/dc4bc_storage"
+	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, mnemonics, usernames)
+	if err != nil {
+		t.Fatalf("Failed to init nodes, err: %v", err)
+	}
+
+	// Each nodeInstance starts to Poll().
+	runCancel := startServerRunAndPoll(nodes, nil)
+
+	messages, err := utils.ReadLogMessages("./test_data/0_1_4_log.csv", rune(';'), true, 4)
+	newCommKeys := map[string][]byte{}
+
+	for _, n := range nodes {
+		newCommKeys[n.client.GetUsername()] = n.client.GetPubKey()
+	}
+
+	reinitDKGMessage, err := types.GenerateReDKGMessage(messages, newCommKeys)
+	if err != nil {
+		t.Fatalf("Failed to create reinit message, err: %v", err)
+	}
+
+	adaptedReDKG, err := node.GetAdaptedReDKG(reinitDKGMessage)
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	reInitDKGBz, err := json.Marshal(adaptedReDKG)
+	if err != nil {
+		t.Fatalf(err.Error())
+	}
+
+	if _, err := http.Post(fmt.Sprintf("http://%s/reinitDKG", nodes[0].listenAddr),
+		"application/json", bytes.NewReader(reInitDKGBz)); err != nil {
+		t.Fatalf("failed to send HTTP request to reinit DKG: %v\n", err)
+	}
+
+	waitForDKG()
+
+	dkgID, err := hex.DecodeString(adaptedReDKG.DKGID)
+	if err != nil {
+		t.Fatalf("failed to decode DKGID, err: %v", err)
+	}
+
+	log.Println("Propose message to sign")
+	messagesToSign := map[string][]byte{
+		"messageID1": []byte("message to sign1"),
+		"messageID2": []byte("message to sign2"),
+	}
+
+	_, err = signBatchMessages(dkgID, messagesToSign, nodes[len(nodes)-1].listenAddr)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	waitForSignMsg()
+
+	for _, n := range nodes {
+		if matches := n.clientLogger.checkLogsWithRegexp(sigReconstructedRegexp, 40); matches != 4 {
+			t.Fatalf("not enough checks: %d", matches)
+		} else {
+			fmt.Println("message signed successfully")
+		}
+	}
+	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0], []int64{})
+	if err != nil {
+		t.Fatalf("failed to verify signatures: %v\n", err)
+	}
+
+	runCancel()
+	for _, node := range nodes {
+		node.httpApi.Stop(node.ctx)
+		node.clientCancel()
+	}
+}
+
+func TestReinitDKGFlow(t *testing.T) {
 	_ = RemoveContents("/tmp", "dc4bc_*")
 	defer func() { _ = RemoveContents("/tmp", "dc4bc_*") }()
 
@@ -1057,12 +1291,10 @@ func testReinitDKGFlow(t *testing.T, convertDKGTo10_1_4 bool) {
 	numNodes := 4
 	threshold := 2
 	startingPort := 8095
-	if convertDKGTo10_1_4 {
-		startingPort = 8100
-	}
+
 	topic := "test_topic"
 	storagePath := "/tmp/dc4bc_storage"
-	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, mnemonics)
+	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, mnemonics, nil)
 	if err != nil {
 		t.Fatalf("Failed to init nodes, err: %v", err)
 	}
@@ -1099,7 +1331,7 @@ func testReinitDKGFlow(t *testing.T, convertDKGTo10_1_4 bool) {
 		}
 	}
 
-	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0])
+	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0], nil)
 	if err != nil {
 		t.Fatalf("failed to verify signatures: %v\n", err)
 	}
@@ -1134,7 +1366,7 @@ func testReinitDKGFlow(t *testing.T, convertDKGTo10_1_4 bool) {
 	waitForNodesStop()
 
 	var newStoragePath = "/tmp/dc4bc_new_storage"
-	newNodes, err := initNodes(numNodes, startingPort, newStoragePath, topic, mnemonics)
+	newNodes, err := initNodes(numNodes, startingPort, newStoragePath, topic, mnemonics, nil)
 	if err != nil {
 		t.Fatalf("Failed to init nodes, err: %v", err)
 	}
@@ -1146,25 +1378,6 @@ func testReinitDKGFlow(t *testing.T, convertDKGTo10_1_4 bool) {
 	reInitDKG, err := types.GenerateReDKGMessage(oldMessages, newCommPubKeys)
 	if err != nil {
 		t.Fatalf(err.Error())
-	}
-
-	if convertDKGTo10_1_4 {
-		// removing dkg_proposal_fsm.EventDKGDealConfirmationReceived self-confirm messages
-		// to make reInitDKG message looks like in release 0.1.4
-		newDKG := convertDKGMessageto0_1_4(*reInitDKG)
-
-		// adding back self-confirm messages
-		// this is our test target
-		adaptedReDKG, err := node.GetAdaptedReDKG(&newDKG)
-		if err != nil {
-			t.Fatalf(err.Error())
-		}
-		reInitDKG = adaptedReDKG
-
-		// skip messages signature verification, since we are unable to sign self-confirm messages by old priv key
-		//for _, nodeInstance := range newNodes {
-		//	nodeInstance.nodeInstance.SetSkipCommKeysVerification(true)
-		//}
 	}
 
 	for _, node := range newNodes {
@@ -1200,7 +1413,7 @@ func testReinitDKGFlow(t *testing.T, convertDKGTo10_1_4 bool) {
 			fmt.Println("message signed successfully")
 		}
 	}
-	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0])
+	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0], nil)
 	if err != nil {
 		t.Fatalf("failed to verify signatures: %v\n", err)
 	}
@@ -1231,7 +1444,7 @@ func testReinitDKGFlow(t *testing.T, convertDKGTo10_1_4 bool) {
 			fmt.Println("messaged signed successfully")
 		}
 	}
-	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0])
+	err = verifySignatures(hex.EncodeToString(dkgID[:]), nodes[0], nil)
 	if err != nil {
 		t.Fatalf("failed to verify signatures: %v\n", err)
 	}
@@ -1243,14 +1456,6 @@ func testReinitDKGFlow(t *testing.T, convertDKGTo10_1_4 bool) {
 	}
 }
 
-func TestReinitDKGFlow(t *testing.T) {
-	testReinitDKGFlow(t, false)
-}
-
-func TestReinitDKGFlowWithDump0_1_4(t *testing.T) {
-	testReinitDKGFlow(t, true)
-}
-
 func TestModifiedMessageSigned(t *testing.T) {
 	_ = RemoveContents("/tmp", "dc4bc_*")
 	defer func() { _ = RemoveContents("/tmp", "dc4bc_*") }()
@@ -1260,7 +1465,7 @@ func TestModifiedMessageSigned(t *testing.T) {
 	startingPort := 8085
 	topic := "test_topic"
 	storagePath := "/tmp/dc4bc_storage"
-	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil)
+	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to init nodes, err: %v", err)
 	}
@@ -1328,7 +1533,7 @@ func TestJunkPartialSignature(t *testing.T) {
 	startingPort := 8085
 	topic := "test_topic"
 	storagePath := "/tmp/dc4bc_storage"
-	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil)
+	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to init nodes, err: %v", err)
 	}
@@ -1405,7 +1610,7 @@ func TestSignWithDifferentDKG(t *testing.T) {
 	startingPort := 8085
 	topic := "test_topic"
 	storagePath := "/tmp/dc4bc_storage"
-	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil)
+	nodes, err := initNodes(numNodes, startingPort, storagePath, topic, nil, nil)
 	if err != nil {
 		t.Fatalf("Failed to init nodes, err: %v", err)
 	}

@@ -1,0 +1,41 @@
+name: Build release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: golang:1.19.4
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          [linux/amd64, linux/arm64, linux/386, darwin/amd64, darwin/arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Compile
+        id: compile
+        run: |
+          echo ${{ matrix.platform }} | {
+            IFS='/' read -r GOOS GOARCH
+
+            output_dir=build
+            export GOOS GOARCH CGO_ENABLED=0
+
+            go build -o $output_dir/dc4bc_d ./cmd/dc4bc_d/
+            go build -o $output_dir/dc4bc_cli ./cmd/dc4bc_cli/
+            go build -o $output_dir/dc4bc_airgapped ./cmd/airgapped/
+            go build -o $output_dir/dc4bc_dkg_reinitializer ./cmd/dkg_reinitializer/
+
+            sha256sum $output_dir/dc4bc_* > "$output_dir/checksum.txt"
+            echo "platform=$GOOS-$GOARCH" >> $GITHUB_OUTPUT
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: build-${{ steps.compile.outputs.platform }}
+          path: build/*
