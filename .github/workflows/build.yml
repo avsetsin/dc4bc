@@ -29,7 +29,7 @@ jobs:
             go build -o build/dc4bc_airgapped ./cmd/airgapped/
             go build -o build/dc4bc_dkg_reinitializer ./cmd/dkg_reinitializer/
 
-            sha256sum build/dc4bc_* > "build/checksum.txt"
+            sha1sum build/dc4bc_* > "build/checksum.txt"
             echo "platform=$GOOS-$GOARCH" >> $GITHUB_OUTPUT
           }
 
