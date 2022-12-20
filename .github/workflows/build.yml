@@ -6,7 +6,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: golang:1.19.4
     strategy:
       fail-fast: false
       matrix:
@@ -16,28 +15,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Compile
-        id: compile
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and export
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          build-args: platform=${{ matrix.platform }}
+          outputs: type=local,dest=./build
+
+      - name: Parse platform
+        id: parse
         run: |
           echo ${{ matrix.platform }} | {
-            IFS='/' read -r GOOS GOARCH
-
-            export GOOS GOARCH CGO_ENABLED=0
-
-            go build -o build/dc4bc_d ./cmd/dc4bc_d/
-            go build -o build/dc4bc_cli ./cmd/dc4bc_cli/
-            go build -o build/dc4bc_airgapped ./cmd/airgapped/
-            go build -o build/dc4bc_dkg_reinitializer ./cmd/dkg_reinitializer/
-
-            sha1sum build/dc4bc_* > "build/checksum.txt"
-            echo "platform=$GOOS-$GOARCH" >> $GITHUB_OUTPUT
+            IFS='/' read -r OS ARCH
+            echo "platform=$OS-$ARCH" >> $GITHUB_OUTPUT
           }
 
       - name: Tar files
-        run: tar -cvf build-${{ steps.compile.outputs.platform }}.tar build/*
+        run: tar -cvf build-${{ steps.parse.outputs.platform }}.tar build/*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v2
         with:
-          name: build-${{ steps.compile.outputs.platform }}
-          path: build-${{ steps.compile.outputs.platform }}.tar
+          name: build-${{ steps.parse.outputs.platform }}
+          path: build-${{ steps.parse.outputs.platform }}.tar
